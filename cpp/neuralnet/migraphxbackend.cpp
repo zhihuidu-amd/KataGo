@@ -93,6 +93,21 @@ struct ComputeContext {
   bool useBatchBuckets;    // compile a ladder of batch sizes instead of only maxBatchSize
 };
 
+// This backend compiles a program per batch size and pads short batches up to the nearest
+// compiled shape, so it is FixedShape rather than Dynamic. Reporting Dynamic would let the
+// search size batches to full concurrency, and every row between the real batch and the
+// compiled shape above it is arithmetic spent on padding.
+NeuralNet::BatchPolicy NeuralNet::getBatchPolicy(ConfigParser& cfg) {
+  (void)cfg;
+  return NeuralNet::BatchPolicy::FixedShape;
+}
+
+int NeuralNet::getNumEffectiveDevices(ConfigParser& cfg, const std::vector<int>& gpuIdxByServerThread) {
+  (void)cfg;
+  std::set<int> distinctDevices(gpuIdxByServerThread.begin(), gpuIdxByServerThread.end());
+  return std::max(1, (int)distinctDevices.size());
+}
+
 ComputeContext* NeuralNet::createComputeContext(
   const vector<int>& gpuIdxs,
   Logger* logger,

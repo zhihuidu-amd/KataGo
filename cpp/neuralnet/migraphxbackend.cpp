@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
 #include <mutex>
@@ -284,6 +285,10 @@ struct ComputeHandle {
   // would not order correctly against MIGraphX, which runs on its own internal stream.
   hipStream_t stream;
 
+  // Second stream for concurrent inference: enables 2-stream concurrent execution with 48-element
+  // batches per stream for higher GPU utilization
+  hipStream_t stream2;
+
   // hipGraph capture was prototyped and set aside. This path is GPU-bound, not launch-bound:
   // instrumenting the eval measured 10.294 ms blocked in hipStreamSynchronize against 0.028 ms
   // of host-side output decode per batch (avgRows 60.8), i.e. the host is 0.3% of the time.
@@ -315,6 +320,11 @@ struct ComputeHandle {
   // Output parameter names, in the order MIGraphX returns them from eval().
   vector<string> outputNames;
 
+  // Second set of buffers for concurrent stream2 execution (to avoid race conditions)
+  map<string, void*> buffers2;
+  // buckets2 shares the same programs as buckets but uses separate program_parameters pointing to buffers2
+  vector<Bucket> buckets2;
+
   // Smallest bucket that can run batchSize rows. Buckets are ascending, and the last one is
   // always maxBatchSize, so this always finds a home for any batchSize <= maxBatchSize.
   const Bucket& bucketFor(int batchSize) const {
@@ -324,6 +334,15 @@ struct ComputeHandle {
     }
     throw StringError(Global::strprintf(
       "MIGraphX backend: batch size %d exceeds maxBatchSize %d", batchSize, maxBatchSize));
+  }
+
+  const Bucket& bucketFor2(int batchSize) const {
+    for(const Bucket& b: buckets2) {
+      if(b.batchSize >= batchSize)
+        return b;
+    }
+    throw StringError(Global::strprintf(
+      "MIGraphX backend stream2: batch size %d exceeds maxBatchSize %d", batchSize, maxBatchSize));
   }
 
   // Hybrid ladder: geometric (8,16,32,64) below the knee, then linear steps of 32 up to
@@ -388,6 +407,7 @@ struct ComputeHandle {
     hasInputMeta = loadedModel->modelDesc.numInputMetaChannels > 0;
 
     HIP_ERR("ComputeHandle", hipStreamCreate(&stream));
+    HIP_ERR("ComputeHandle", hipStreamCreate(&stream2));
 
     const ModelDesc& desc = loadedModel->modelDesc;
 
@@ -461,7 +481,10 @@ struct ComputeHandle {
             cacheDir, onnxBytes, bucketBatchSize, willUseFP16, ctx->useExhaustiveTune, gcnArchName);
           if(FileUtils::exists(cachePath)) {
             try {
+              auto cacheLoadStart = std::chrono::steady_clock::now();
               migraphx::program cachedProg = migraphx::load(cachePath.c_str());
+              auto cacheLoadEnd = std::chrono::steady_clock::now();
+              double cacheLoadMs = std::chrono::duration<double, std::milli>(cacheLoadEnd - cacheLoadStart).count();
               Bucket cachedBucket;
               cachedBucket.batchSize = bucketBatchSize;
               cachedBucket.prog = std::move(cachedProg);
@@ -469,7 +492,7 @@ struct ComputeHandle {
               usingFP16 = willUseFP16;
               if(logger != NULL)
                 logger->write(Global::strprintf(
-                  "MIGraphX backend: loaded cached program for batch size %d", bucketBatchSize));
+                  "MIGraphX backend: loaded cached program for batch size %d in %.1f ms", bucketBatchSize, cacheLoadMs));
               continue;
             }
             catch(const std::exception& e) {
@@ -505,7 +528,14 @@ struct ComputeHandle {
         options.set_offload_copy(false);
         options.set_fast_math(true);
         options.set_exhaustive_tune_flag(ctx->useExhaustiveTune);
+
+        auto compileStart = std::chrono::steady_clock::now();
         bucketProg.compile(migraphx::target("gpu"), options);
+        auto compileEnd = std::chrono::steady_clock::now();
+        double compileMs = std::chrono::duration<double, std::milli>(compileEnd - compileStart).count();
+        if(logger != NULL)
+          logger->write(Global::strprintf(
+            "MIGraphX backend: compiled program for batch size %d in %.1f ms", bucketBatchSize, compileMs));
 
         if(!cachePath.empty())
           saveProgramCache(bucketProg, cachePath, logger);
@@ -634,6 +664,47 @@ struct ComputeHandle {
       }
     }
 
+    // Allocate second set of buffers for stream2 concurrent execution
+    for(const string& name: paramNames) {
+      migraphx::shape s = paramShapes[name.c_str()];
+      size_t bytes = s.bytes();
+      void* devPtr = nullptr;
+      HIP_ERR("ComputeHandle", hipMalloc(&devPtr, bytes));
+      HIP_ERR("ComputeHandle", hipMemset(devPtr, 0, bytes));
+      buffers2[name] = devPtr;
+    }
+
+    // Create buckets2 with same programs but pointing to buffers2
+    buckets2.resize(buckets.size());
+    for(size_t bi = 0; bi < buckets.size(); bi++) {
+      buckets2[bi].batchSize = buckets[bi].batchSize;
+      buckets2[bi].prog = buckets[bi].prog;
+
+      migraphx::program_parameter_shapes bucketShapes = buckets[bi].prog.get_parameter_shapes();
+      vector<string> bucketNames;
+      for(const char* n: bucketShapes.names())
+        bucketNames.emplace_back(n);
+
+      for(const string& name: bucketNames) {
+        migraphx::shape s = bucketShapes[name.c_str()];
+        auto it = buffers2.find(name);
+        if(it == buffers2.end())
+          throw StringError(
+            "MIGraphX backend stream2: bucket " + Global::intToString(buckets2[bi].batchSize) +
+            " has parameter " + name + " that the max bucket does not");
+
+        void* devPtr = it->second;
+        if(s.bytes() > bufferBytes.at(name)) {
+          // Scratch allocation for stream2 buckets
+          HIP_ERR("ComputeHandle", hipMalloc(&devPtr, s.bytes()));
+          HIP_ERR("ComputeHandle", hipMemset(devPtr, 0, s.bytes()));
+          string ownName = name + "#bucket" + Global::uint64ToString((uint64_t)bi) + "#stream2";
+          buffers2[ownName] = devPtr;
+        }
+        buckets2[bi].params.add(name.c_str(), migraphx::argument(s, devPtr));
+      }
+    }
+
     // Inputs are addressable by their ONNX names directly.
     for(const char* n: {"InputMask", "InputSpatial", "InputGlobal"})
       aliasName[n] = n;
@@ -690,10 +761,15 @@ struct ComputeHandle {
   ~ComputeHandle() {
     // Destructors must not throw, so free errors are swallowed rather than routed through HIP_ERR.
     (void)hipStreamSynchronize(stream);
+    (void)hipStreamSynchronize(stream2);
     for(auto& kv: buffers) {
       (void)hipFree(kv.second);
     }
+    for(auto& kv: buffers2) {
+      (void)hipFree(kv.second);
+    }
     (void)hipStreamDestroy(stream);
+    (void)hipStreamDestroy(stream2);
   }
 
   ComputeHandle() = delete;
@@ -714,6 +790,10 @@ struct ComputeHandle {
 
   void* getBuffer(const char* name) const {
     return buffers.at(resolveName(name));
+  }
+
+  void* getBuffer2(const char* name) const {
+    return buffers2.at(resolveName(name));
   }
 
   size_t getBufferBytes(const char* name) const {
@@ -1007,21 +1087,54 @@ void NeuralNet::getOutput(
   // The copy is one contiguous memcpy of (shapeBatchSize-batchSize) mask rows and is negligible
   // next to the forward pass.
   hipStream_t stream = gpuHandle->stream;
+  hipStream_t stream2 = gpuHandle->stream2;
 
-  // Dispatch to the smallest compiled bucket that fits, and pad only up to THAT bucket rather
-  // than up to maxBatchSize. This is the whole point of bucketing: at 192 threads the search's
-  // mean batch is ~89, so a single maxBatchSize program spends over half its compute on padding.
-  const ComputeHandle::Bucket& bucket = gpuHandle->bucketFor(batchSize);
-  const int shapeBatchSize = bucket.batchSize;
+  // 2-stream concurrent inference: split batch into 48-element chunks for stream and stream2
+  const int streamBatchSize = 48;
+  const int batchSize1 = std::min(batchSize, streamBatchSize);
+  const int batchSize2 = (batchSize > streamBatchSize) ? std::min(batchSize - streamBatchSize, streamBatchSize) : 0;
 
-  if(batchSize < shapeBatchSize) {
-    const int padRows = shapeBatchSize - batchSize;
-    if(inputBuffers->paddingMaskOnes.size() != inputBuffers->singleMaskElts * (size_t)padRows)
-      inputBuffers->paddingMaskOnes.assign(inputBuffers->singleMaskElts * (size_t)padRows, 1.0f);
+  // There are exactly two buffer sets (buffers/buffers2) and two bucket ladders,
+  // so at most 2*streamBatchSize rows can be in flight. Anything beyond that
+  // would be dropped: not copied, not evaluated, and not written back, leaving
+  // stale values in the caller's output arrays with no error raised.
+  //
+  // Refuse instead. A run that dies at nnMaxBatchSize=128 is fixable; a run that
+  // reports higher nnEvals/s because it quietly evaluated 96 of 128 rows is a
+  // measurement that looks exactly like the speedup we are trying to find.
+  if(batchSize1 + batchSize2 < batchSize)
+    throw StringError(Global::strprintf(
+      "MIGraphX backend: batch size %d exceeds the 2-stream capacity of %d "
+      "(%d rows would be silently dropped). Lower nnMaxBatchSize to %d or less, "
+      "or extend the split to more than two streams.",
+      batchSize, 2 * streamBatchSize, batchSize - (batchSize1 + batchSize2),
+      2 * streamBatchSize));
+
+  // Size the shared padding buffer ONCE, to the larger of the two streams' pad
+  // counts, before either async copy is issued. Both streams copy from
+  // paddingMaskOnes.data(); letting stream 2 assign() it later can reallocate
+  // the vector while stream 1's DMA is still reading the old pointer.
+  {
+    const int pad1 = gpuHandle->bucketFor(batchSize1).batchSize - batchSize1;
+    const int pad2 = (batchSize2 > 0)
+      ? gpuHandle->bucketFor2(batchSize2).batchSize - batchSize2 : 0;
+    const size_t maxPadRows = (size_t)std::max(std::max(pad1, pad2), 0);
+    if(inputBuffers->paddingMaskOnes.size() < inputBuffers->singleMaskElts * maxPadRows)
+      inputBuffers->paddingMaskOnes.assign(inputBuffers->singleMaskElts * maxPadRows, 1.0f);
+  }
+
+  // Stream 1: process first 48 elements
+  const ComputeHandle::Bucket& bucket1 = gpuHandle->bucketFor(batchSize1);
+  const int shapeBatchSize1 = bucket1.batchSize;
+
+  if(batchSize1 < shapeBatchSize1) {
+    const int padRows = shapeBatchSize1 - batchSize1;
+    // paddingMaskOnes was sized above for both streams -- do not assign() here,
+    // stream 2 may already have an async copy in flight from the same pointer.
     HIP_ERR(
       "getOutput",
       hipMemcpyAsync(
-        (char*)gpuHandle->getBuffer("InputMask") + inputBuffers->singleMaskBytes * batchSize,
+        (char*)gpuHandle->getBuffer("InputMask") + inputBuffers->singleMaskBytes * batchSize1,
         inputBuffers->paddingMaskOnes.data(), inputBuffers->singleMaskBytes * (size_t)padRows,
         hipMemcpyHostToDevice, stream));
   }
@@ -1029,61 +1142,138 @@ void NeuralNet::getOutput(
     "getOutput",
     hipMemcpyAsync(
       gpuHandle->getBuffer("InputMask"), inputBuffers->maskInputs,
-      inputBuffers->singleMaskBytes * batchSize, hipMemcpyHostToDevice, stream));
+      inputBuffers->singleMaskBytes * batchSize1, hipMemcpyHostToDevice, stream));
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       gpuHandle->getBuffer("InputSpatial"), inputBuffers->spatialInputs,
-      inputBuffers->singleInputBytes * batchSize, hipMemcpyHostToDevice, stream));
+      inputBuffers->singleInputBytes * batchSize1, hipMemcpyHostToDevice, stream));
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       gpuHandle->getBuffer("InputGlobal"), inputBuffers->globalInputs,
-      inputBuffers->singleInputGlobalBytes * batchSize, hipMemcpyHostToDevice, stream));
+      inputBuffers->singleInputGlobalBytes * batchSize1, hipMemcpyHostToDevice, stream));
   if(numMetaFeatures > 0) {
     HIP_ERR(
       "getOutput",
       hipMemcpyAsync(
         gpuHandle->getBuffer("InputMeta"), inputBuffers->metaInputs,
-        inputBuffers->singleInputMetaBytes * batchSize, hipMemcpyHostToDevice, stream));
+        inputBuffers->singleInputMetaBytes * batchSize1, hipMemcpyHostToDevice, stream));
   }
 
-  // run_async rather than eval: eval() runs on MIGraphX's own internal stream, which is not
-  // ordered against the copies above, so the program could read inputs before they land.
-  //
-  // const_cast: run_async is non-const in the MIGraphX C++ API, but selecting a bucket is a
-  // read-only operation on the handle and the buffers it writes are this handle's own.
-  const_cast<ComputeHandle::Bucket&>(bucket).prog.run_async(
-    const_cast<ComputeHandle::Bucket&>(bucket).params, stream);
+  const_cast<ComputeHandle::Bucket&>(bucket1).prog.run_async(
+    const_cast<ComputeHandle::Bucket&>(bucket1).params, stream);
 
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       inputBuffers->policyPassResults, gpuHandle->getBuffer("OutputPolicyPass"),
-      inputBuffers->singlePolicyPassResultBytes * batchSize, hipMemcpyDeviceToHost, stream));
+      inputBuffers->singlePolicyPassResultBytes * batchSize1, hipMemcpyDeviceToHost, stream));
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       inputBuffers->policyResults, gpuHandle->getBuffer("OutputPolicy"),
-      inputBuffers->singlePolicyResultBytes * batchSize, hipMemcpyDeviceToHost, stream));
+      inputBuffers->singlePolicyResultBytes * batchSize1, hipMemcpyDeviceToHost, stream));
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       inputBuffers->valueResults, gpuHandle->getBuffer("OutputValue"),
-      inputBuffers->singleValueResultBytes * batchSize, hipMemcpyDeviceToHost, stream));
+      inputBuffers->singleValueResultBytes * batchSize1, hipMemcpyDeviceToHost, stream));
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       inputBuffers->scoreValueResults, gpuHandle->getBuffer("OutputScoreValue"),
-      inputBuffers->singleScoreValueResultBytes * batchSize, hipMemcpyDeviceToHost, stream));
+      inputBuffers->singleScoreValueResultBytes * batchSize1, hipMemcpyDeviceToHost, stream));
   HIP_ERR(
     "getOutput",
     hipMemcpyAsync(
       inputBuffers->ownershipResults, gpuHandle->getBuffer("OutputOwnership"),
-      inputBuffers->singleOwnershipResultBytes * batchSize, hipMemcpyDeviceToHost, stream));
+      inputBuffers->singleOwnershipResultBytes * batchSize1, hipMemcpyDeviceToHost, stream));
 
-  // One sync per eval, after all the D2H copies are queued, rather than an implicit sync per copy.
+  // Stream 2: process second 48 elements concurrently (if batchSize > 48)
+  if(batchSize2 > 0) {
+    const ComputeHandle::Bucket& bucket2 = gpuHandle->bucketFor2(batchSize2);
+    const int shapeBatchSize2 = bucket2.batchSize;
+
+    // Offset pointers to start at element 48
+    const size_t offset = streamBatchSize;
+
+    if(batchSize2 < shapeBatchSize2) {
+      const int padRows = shapeBatchSize2 - batchSize2;
+      HIP_ERR(
+        "getOutput",
+        hipMemcpyAsync(
+          (char*)gpuHandle->getBuffer2("InputMask") + inputBuffers->singleMaskBytes * batchSize2,
+          inputBuffers->paddingMaskOnes.data(), inputBuffers->singleMaskBytes * (size_t)padRows,
+          hipMemcpyHostToDevice, stream2));
+    }
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        gpuHandle->getBuffer2("InputMask"),
+        inputBuffers->maskInputs + inputBuffers->singleMaskElts * offset,
+        inputBuffers->singleMaskBytes * batchSize2, hipMemcpyHostToDevice, stream2));
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        gpuHandle->getBuffer2("InputSpatial"),
+        inputBuffers->spatialInputs + inputBuffers->singleInputElts * offset,
+        inputBuffers->singleInputBytes * batchSize2, hipMemcpyHostToDevice, stream2));
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        gpuHandle->getBuffer2("InputGlobal"),
+        inputBuffers->globalInputs + inputBuffers->singleInputGlobalElts * offset,
+        inputBuffers->singleInputGlobalBytes * batchSize2, hipMemcpyHostToDevice, stream2));
+    if(numMetaFeatures > 0) {
+      HIP_ERR(
+        "getOutput",
+        hipMemcpyAsync(
+          gpuHandle->getBuffer2("InputMeta"),
+          inputBuffers->metaInputs + inputBuffers->singleInputMetaElts * offset,
+          inputBuffers->singleInputMetaBytes * batchSize2, hipMemcpyHostToDevice, stream2));
+    }
+
+    const_cast<ComputeHandle::Bucket&>(bucket2).prog.run_async(
+      const_cast<ComputeHandle::Bucket&>(bucket2).params, stream2);
+
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        inputBuffers->policyPassResults + inputBuffers->singlePolicyPassResultElts * offset,
+        gpuHandle->getBuffer2("OutputPolicyPass"),
+        inputBuffers->singlePolicyPassResultBytes * batchSize2, hipMemcpyDeviceToHost, stream2));
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        inputBuffers->policyResults + inputBuffers->singlePolicyResultElts * offset,
+        gpuHandle->getBuffer2("OutputPolicy"),
+        inputBuffers->singlePolicyResultBytes * batchSize2, hipMemcpyDeviceToHost, stream2));
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        inputBuffers->valueResults + inputBuffers->singleValueResultElts * offset,
+        gpuHandle->getBuffer2("OutputValue"),
+        inputBuffers->singleValueResultBytes * batchSize2, hipMemcpyDeviceToHost, stream2));
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        inputBuffers->scoreValueResults + inputBuffers->singleScoreValueResultElts * offset,
+        gpuHandle->getBuffer2("OutputScoreValue"),
+        inputBuffers->singleScoreValueResultBytes * batchSize2, hipMemcpyDeviceToHost, stream2));
+    HIP_ERR(
+      "getOutput",
+      hipMemcpyAsync(
+        inputBuffers->ownershipResults + inputBuffers->singleOwnershipResultElts * offset,
+        gpuHandle->getBuffer2("OutputOwnership"),
+        inputBuffers->singleOwnershipResultBytes * batchSize2, hipMemcpyDeviceToHost, stream2));
+  }
+
+  // Synchronize both streams
   HIP_ERR("getOutput", hipStreamSynchronize(stream));
+  if(batchSize2 > 0) {
+    HIP_ERR("getOutput", hipStreamSynchronize(stream2));
+  }
 
   assert(outputs.size() == batchSize);
 

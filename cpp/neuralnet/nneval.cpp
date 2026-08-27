@@ -109,6 +109,7 @@ NNEvaluator::NNEvaluator(
    currentDoRandomize(doRandomize),
    currentDefaultSymmetry(defaultSymmetry),
    maxRowsToSendPerBatch(maxBatchSz),
+   batchCoalescingWaitMs(cfg.contains("nnBatchCoalescingWaitMs") ? cfg.getInt("nnBatchCoalescingWaitMs", 0, 100) : 0),
    queryQueue()
 {
   if(nnXLen > NNPos::MAX_BOARD_LEN)
@@ -837,7 +838,13 @@ void NNEvaluator::serve(
   while(true) {
     resultBufs.clear();
     int desiredBatchSize = std::min(maxBatchSize, maxRowsToSendPerBatch.load(std::memory_order_acquire));
-    bool gotAnything = queryQueue.waitPopUpToN(resultBufs,desiredBatchSize);
+    bool gotAnything;
+    if(batchCoalescingWaitMs > 0) {
+      gotAnything = queryQueue.waitPopUpToNWithCoalescingTimeout(resultBufs, desiredBatchSize, batchCoalescingWaitMs);
+    }
+    else {
+      gotAnything = queryQueue.waitPopUpToN(resultBufs, desiredBatchSize);
+    }
     // Queue being closed is a signal that we're done.
     if(!gotAnything)
       break;

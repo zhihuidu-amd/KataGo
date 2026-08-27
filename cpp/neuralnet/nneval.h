@@ -323,6 +323,8 @@ class NNEvaluator {
   std::atomic<int> currentDefaultSymmetry;
   // See setMaxRowsToSendPerBatch
   std::atomic<int> maxRowsToSendPerBatch;
+  // Milliseconds to wait for more queries to batch together after receiving the first one
+  const int batchCoalescingWaitMs;
 
   // Queued up requests
   ThreadSafeQueue<NNResultBuf*> queryQueue;

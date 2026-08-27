@@ -188,6 +188,53 @@ class ThreadSafeContainer
     return true;
   }
 
+  // Like waitPopUpToN, but waits up to timeoutMs milliseconds for more items to arrive after
+  // the first item, to allow batching. If the timeout expires or the queue fills to N items,
+  // pops and returns what's available.
+  // Returns true if successful, false if no elements were popped (queue is closed, or empty and readonly).
+  inline bool waitPopUpToNWithCoalescingTimeout(std::vector<T>& buf, size_t n, int timeoutMs)
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    // Wait for at least one item
+    while(!closed && !readOnly && sizeUnsynchronized() <= 0)
+      notEmptyCondVar.wait(lock);
+    if(closed)
+      return false;
+    size_t size = sizeUnsynchronized();
+    if(size <= 0)
+      return false;
+
+    // If timeout is zero or we already have enough items, pop immediately
+    if(timeoutMs <= 0 || size >= n) {
+      size_t numToPop = std::min(size,n);
+      for(size_t i = 0; i<numToPop; i++)
+        buf.push_back(popUnsynchronized());
+      if(size >= maxSize && size < maxSize + n)
+        notFullCondVar.notify_all();
+      return true;
+    }
+
+    // Wait up to timeoutMs for more items to arrive
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while(!closed && !readOnly && sizeUnsynchronized() < n) {
+      if(notEmptyCondVar.wait_until(lock, deadline) == std::cv_status::timeout)
+        break;
+    }
+
+    // Pop whatever we have now
+    if(closed)
+      return false;
+    size = sizeUnsynchronized();
+    if(size <= 0)
+      return false;
+    size_t numToPop = std::min(size,n);
+    for(size_t i = 0; i<numToPop; i++)
+      buf.push_back(popUnsynchronized());
+    if(size >= maxSize && size < maxSize + n)
+      notFullCondVar.notify_all();
+    return true;
+  }
+
 };
 
 
